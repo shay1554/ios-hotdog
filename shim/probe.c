@@ -532,7 +532,7 @@ probe_report(uintptr_t dtb)
 		z[i] = 0;
 	}
 	con_str("PROBE", "live FDT report");
-	probe_tlmm();
+	/* probe_tlmm(); */
 
 	if (!dtb || be32(dtb) != FDT_MAGIC) {
 		con_str("DTB", "no device tree");

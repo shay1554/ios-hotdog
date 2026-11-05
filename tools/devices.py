@@ -100,6 +100,40 @@ DEVICES = {
         'memory_frequency': 2133000000,
         'bus_frequency': 100000000,
     },
+    'hotdogb': {
+        # OnePlus 7T (hotdogb, SM8150-AC, project 18865). Same platform as
+        # guacamole; only the panel/touch differ. fb + splash audited against
+        # this phone's own boot_a DTB (2026-11-05): cont_splash_region
+        # 0x9c000000 + 0x2400000, panel 1080x2400. Touch is a Synaptics S3706
+        # at 0x20 on GENI SE17 (i2c@0xc80000), irq gpio 122, reset gpio 54,
+        # from the stock dtbo fragment@97/@125.
+        'name': 'OnePlus 7T (hotdogb, SM8150-AC)',
+        'board_compat': 'oneplus,hotdogb',
+        'soc_compat': 'qcom,sm8150',
+        'phys_base': 0xc0000000,
+        'mem_size': 0xc0000000,
+        'high_phys_base': 0x180000000,
+        'high_mem_size': 0x100000000,
+        'gicd': 0x17a00000,
+        'gicd_size': 0x10000,
+        'gicr': 0x17a60000,
+        'gicr_size': 0x100000,
+        'timebase': 19200000,
+        'vtimer_intid': 19,
+        'fb': 0x9c000000,
+        'fb_size': 0x2400000,
+        'fb_w': 1080,
+        'fb_h': 2400,
+        'fb_stride': 1080 * 4,
+        'ufs': 0x01d84000,
+        'ufs_size': 0x3000,
+        'cpu_compat': 'qcom,kryo485',
+        'cpus': 8,
+        'cpu_regs': [0, 0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700],
+        'cpu_clocks': [1785600000] * 4 + [2419200000] * 3 + [2841600000],
+        'memory_frequency': 2133000000,
+        'bus_frequency': 100000000,
+    },
 }
 
 
