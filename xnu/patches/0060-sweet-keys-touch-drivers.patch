@@ -286,6 +286,8 @@
 +	int x[TOUCH_MAX], y[TOUCH_MAX];
 +} st;
 +static int touch_sleep_chan;
++static void
++touch_swipe_unlock(void);
 +
 +static uint32_t
 +touch_rd(vm_offset_t base, uint32_t off)
@@ -534,34 +536,6 @@
 +	st.active = mask;
 +}
 +
-+/*
-+ * Synthetic unlock swipe (boot-arg sweetunlock=1): the 7T touch IC is not
-+ * driven yet, so emit a HID swipe on the lock screen through the same path
-+ * the real driver uses. Two attempts, in case the first is too early.
-+ */
-+static void
-+touch_swipe_unlock(void)
-+{
-+	int x[1], y[1];
-+	const int x0 = 562, y0 = 2150, y1 = 1000, steps = 20;
-+	printf("SWEET TOUCH: synthetic unlock swipe\n");
-+	for (int attempt = 0; attempt < 2; ++attempt) {
-+		touch_wait(35000);
-+		x[0] = x0;
-+		y[0] = y0;
-+		touch_report(1, x, y);
-+		for (int i = 1; i <= steps; ++i) {
-+			y[0] = y0 + (y1 - y0) * i / steps;
-+			touch_report(1, x, y);
-+			touch_wait(8);
-+		}
-+		x[0] = x0;
-+		y[0] = y1;
-+		touch_report(0, x, y);
-+		printf("SWEET TOUCH: swipe %d done\n", attempt + 1);
-+	}
-+}
-+
 +static int
 +touch_goodix(void)
 +{
@@ -756,11 +730,6 @@
 +	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
 +	printf("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
 +	    fe1, fe2, fid1, fid2, st.irq_status);
-+	int unlock = 0;
-+	(void)PE_parse_boot_argn("sweetunlock", &unlock, sizeof(unlock));
-+	if (unlock) {
-+		touch_swipe_unlock();
-+	}
 +	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '9' && gid[3] == '6';
 +	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
 +	if (st.dead || goodix == fts) {
@@ -818,4 +787,51 @@
 +		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
 +	}
 +}
++	int unlock = 0;
++	if (PE_parse_boot_argn("sweetunlock", &unlock, sizeof(unlock)) && unlock) {
++		kr = kernel_thread_start(touch_swipe_thread, NULL, &thread);
++		if (kr == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("SWEET TOUCH: swipe thread failed %d\n", kr);
++		}
++	}
++/*
++ * Synthetic unlock swipe (boot-arg sweetunlock=1): the 7T touch IC is not
++ * driven yet, so emit a HID swipe on the lock screen through the same path
++ * the real driver uses. Two attempts, in case the first is too early.
++ */
++static void
++touch_swipe_unlock(void)
++{
++	int x[1], y[1];
++	const int x0 = 562, y0 = 2150, y1 = 1000, steps = 20;
++	printf("SWEET TOUCH: synthetic unlock swipe\n");
++	for (int attempt = 0; attempt < 2; ++attempt) {
++		touch_wait(35000);
++		x[0] = x0;
++		y[0] = y0;
++		touch_report(1, x, y);
++		for (int i = 1; i <= steps; ++i) {
++			y[0] = y0 + (y1 - y0) * i / steps;
++			touch_report(1, x, y);
++			touch_wait(8);
++		}
++		x[0] = x0;
++		y[0] = y1;
++		touch_report(0, x, y);
++		printf("SWEET TOUCH: swipe %d done\n", attempt + 1);
++	}
++}
++
++static void
++touch_swipe_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	touch_swipe_unlock();
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
