@@ -1,5 +1,5 @@
---- a/bsd/dev/sweet_keys.c	2026-11-07 22:01:59.323831581 +0200
-+++ b/bsd/dev/sweet_keys.c	2026-11-07 22:01:59.323868281 +0200
+--- a/bsd/dev/sweet_keys.c	2026-11-07 22:22:14.571817254 +0200
++++ b/bsd/dev/sweet_keys.c	2026-11-07 22:22:14.571854254 +0200
 @@ -15,8 +15,11 @@
  #include <pexpert/arm64/sweet_dev.h>
  
@@ -43,11 +43,11 @@
 +static void
 +sweet_swipe_thread(void *arg, wait_result_t result)
 +{
-+	const int x = 562, y0 = 2150, y1 = 1000, steps = 20;
++	const int x = 562, y0 = 2300, y1 = 900, steps = 28;
 +	(void)arg;
 +	(void)result;
-+	for (int attempt = 0; attempt < 2; ++attempt) {
-+		swipe_wait(35000);
++	for (int attempt = 0; attempt < 12; ++attempt) {
++		swipe_wait(attempt ? 25000 : 45000);
 +		printf("SWEET KEYS: synthetic unlock swipe %d\n", attempt + 1);
 +		sweet_hid_touch(0, 1, x, y0);
 +		for (int i = 1; i <= steps; ++i) {
