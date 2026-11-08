@@ -1,0 +1,647 @@
+--- a/bsd/dev/sweet_touch_sec.c
++++ b/bsd/dev/sweet_touch_sec.c
+@@ -67,6 +67,7 @@
+ 
+ /* Touch pins on this board (live device tree: tp_1v8/tp_rst/tp_irq). */
+ #define TS_PIN_RESET    54u
++#define TS_PIN_RESET_7T 80u	/* hotdogb S3706 reset (project 18865) */
+ #define TS_PIN_1V8      119u
+ #define TS_PIN_IRQ      122u
+ /* SE17 I2C lines; the roles are auto-detected at run time. */
+@@ -115,6 +116,12 @@
+ 	uint8_t id[3];
+ 	int x[TS_MAX_FINGERS], y[TS_MAX_FINGERS];
+ 	bool down[TS_MAX_FINGERS];
++	bool syna;
++	uint8_t syna_addr;
++	unsigned syna_reports;
++	unsigned syna_max_x, syna_max_y;
++	unsigned syna_cfg_len;
++	uint8_t syna_cfg[128];
+ } ts;
+ 
+ static uint32_t
+@@ -319,6 +326,22 @@
+ 	return err;
+ }
+ 
++/* TouchComm is not a register protocol: a read is just the address byte. */
++static int
++bb_read_raw(uint8_t addr, uint8_t *buf, unsigned n)
++{
++	int err;
++
++	bb_start();
++	bb_tx_byte((uint8_t)((addr << 1) | 1u));
++	err = bb_ack();
++	for (unsigned i = 0; i < n && err == 0; ++i) {
++		buf[i] = bb_rx_byte(i + 1u < n);
++	}
++	bb_stop();
++	return err;
++}
++
+ /* Clock nine pulses so a target holding SDA low can let go. */
+ static void
+ bb_recover(void)
+@@ -481,6 +504,575 @@
+ 	}
+ }
+ 
++
++/*
++ * OnePlus 7T (hotdogb, project 18865) glass is a Synaptics S3706 at 7-bit
++ * address 0x20, reset gpio 80, irq gpio 122 active-low. It speaks TouchComm,
++ * not the Samsung sec_ts protocol this file probes first. After that probe
++ * fails, this path powers the right reset pin and feeds sweet_hid_touch().
++ *
++ * Report bits follow synaptics_tcm_touch.c: the config is a list of codes,
++ * data codes are followed by a bit width, and FOREACH_ACTIVE_OBJECT repeats
++ * while another whole object still fits in the report.
++ */
++#define SYNA_ADDR         0x20u
++#define SYNA_MARKER       0xa5u
++#define SYNA_STATUS_OK    0x01u
++#define SYNA_STATUS_CONT  0x03u
++#define SYNA_CMD_IDENTIFY 0x02u
++#define SYNA_CMD_ENABLE   0x05u
++#define SYNA_CMD_RUN_APP  0x14u
++#define SYNA_CMD_APPINFO  0x20u
++#define SYNA_CMD_GET_CFG  0x25u
++#define SYNA_CMD_SET_CFG  0x26u
++#define SYNA_CMD_SET_DC   0x24u
++#define SYNA_REPORT_ID    0x10u
++#define SYNA_REPORT_TOUCH 0x11u
++#define SYNA_MODE_APP     0x01u
++#define SYNA_PAD          0x5au
++
++static uint8_t syna_msg[192];
++static uint8_t syna_bounce[192];
++static int syna_irq_level = 0;
++static unsigned syna_shape_log;
++
++static void
++syna_log_hex(const char *tag, const uint8_t *p, unsigned n)
++{
++	char line[96];
++	unsigned k = 0;
++	static const char hex[] = "0123456789abcdef";
++
++	if (n > 24) {
++		n = 24;
++	}
++	for (unsigned i = 0; i < n && k + 3 < sizeof(line); ++i) {
++		line[k++] = hex[p[i] >> 4];
++		line[k++] = hex[p[i] & 0xf];
++		line[k++] = ' ';
++	}
++	line[k] = 0;
++	printf("SWEET TOUCH: syna %s %s\n", tag, line);
++}
++
++static unsigned
++syna_bits(const uint8_t *data, unsigned len, unsigned bit, unsigned nbits)
++{
++	unsigned value = 0;
++	unsigned got = 0;
++
++	while (got < nbits) {
++		unsigned pos = bit + got;
++		unsigned byte = pos / 8u;
++		unsigned shift = pos % 8u;
++		unsigned room = 8u - shift;
++		unsigned take = nbits - got;
++		unsigned mask;
++		if (take > room) {
++			take = room;
++		}
++		if (byte >= len) {
++			break;
++		}
++		mask = (1u << take) - 1u;
++		value |= ((data[byte] >> shift) & mask) << got;
++		got += take;
++	}
++	return value;
++}
++
++static int
++syna_read_msg(uint8_t *buf, unsigned cap, unsigned *out_len)
++{
++	uint8_t hdr[4];
++	unsigned len, need;
++	int err;
++
++	*out_len = 0;
++	if (cap < 4) {
++		return EINVAL;
++	}
++	err = bb_read_raw(ts.syna_addr, hdr, 4);
++	if (err) {
++		return err;
++	}
++	if (hdr[0] != SYNA_MARKER) {
++		return EAGAIN;
++	}
++	/* Idle, busy, or a continued-read header: nothing to dispatch. */
++	if (hdr[1] == 0x00 || hdr[1] == 0x02 || hdr[1] == SYNA_STATUS_CONT) {
++		return EAGAIN;
++	}
++	len = (unsigned)hdr[2] | ((unsigned)hdr[3] << 8);
++	if (len > 160) {
++		len = 160;
++	}
++	buf[0] = hdr[0];
++	buf[1] = hdr[1];
++	buf[2] = (uint8_t)len;
++	buf[3] = (uint8_t)(len >> 8);
++	if (len == 0) {
++		*out_len = 4;
++		return 0;
++	}
++	/* Next transaction is the rest: marker, CONTINUED_READ, payload, 0x5a. */
++	need = len + 3;
++	if (need > sizeof(syna_bounce)) {
++		need = sizeof(syna_bounce);
++	}
++	err = bb_read_raw(ts.syna_addr, syna_bounce, need);
++	if (err) {
++		return err;
++	}
++	if (syna_shape_log < 2) {
++		syna_shape_log++;
++		syna_log_hex("cont", syna_bounce, need > 8 ? 8 : need);
++	}
++	if (syna_bounce[0] == SYNA_MARKER && syna_bounce[1] == SYNA_STATUS_CONT) {
++		if (len > cap - 4) {
++			len = cap - 4;
++		}
++		for (unsigned i = 0; i < len; ++i) {
++			buf[4 + i] = syna_bounce[2 + i];
++		}
++		*out_len = 4 + len;
++		return 0;
++	}
++	if (syna_bounce[0] == SYNA_MARKER) {
++		unsigned n = 4 + len;
++		if (n > cap) {
++			n = cap;
++		}
++		if (n > need) {
++			n = need;
++		}
++		for (unsigned i = 0; i < n; ++i) {
++			buf[i] = syna_bounce[i];
++		}
++		*out_len = n;
++		return 0;
++	}
++	if (len > cap - 4) {
++		len = cap - 4;
++	}
++	for (unsigned i = 0; i < len; ++i) {
++		buf[4 + i] = syna_bounce[i];
++	}
++	*out_len = 4 + len;
++	return 0;
++}
++
++static int
++syna_cmd(uint8_t cmd, const uint8_t *data, unsigned n,
++    uint8_t *buf, unsigned cap, unsigned *out_len)
++{
++	uint8_t pkt[48];
++	int err;
++
++	if (n + 3 > sizeof(pkt)) {
++		return E2BIG;
++	}
++	pkt[0] = cmd;
++	pkt[1] = (uint8_t)n;
++	pkt[2] = (uint8_t)(n >> 8);
++	for (unsigned i = 0; i < n; ++i) {
++		pkt[3 + i] = data[i];
++	}
++	err = bb_write(ts.syna_addr, pkt, n + 3);
++	if (err) {
++		return err;
++	}
++	for (unsigned spin = 0; spin < 80; ++spin) {
++		int level = (int)(ts_gpio_io_rd(TS_PIN_IRQ) & 1u);
++		if (level != 0 && spin < 40) {
++			ts_wait(5);
++			continue;
++		}
++		err = syna_read_msg(buf, cap, out_len);
++		if (err == EAGAIN || err == ENXIO) {
++			ts_wait(5);
++			continue;
++		}
++		if (err) {
++			return err;
++		}
++		if (buf[1] == SYNA_STATUS_OK) {
++			return 0;
++		}
++		if (cmd == SYNA_CMD_IDENTIFY && buf[1] == SYNA_REPORT_ID) {
++			return 0;
++		}
++		if (buf[1] >= SYNA_REPORT_ID) {
++			continue;
++		}
++		printf("SWEET TOUCH: syna cmd %02x status %02x\n", cmd, buf[1]);
++		return EIO;
++	}
++	return ETIMEDOUT;
++}
++
++static void
++syna_log_id(const uint8_t *msg, unsigned len)
++{
++	char part[17];
++	unsigned n, mode;
++
++	if (len < 6) {
++		printf("SWEET TOUCH: syna id short %u\n", len);
++		return;
++	}
++	mode = msg[5];
++	n = len - 6;
++	if (n > 16) {
++		n = 16;
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		uint8_t c = msg[6 + i];
++		part[i] = (c >= 32 && c < 127) ? (char)c : '.';
++	}
++	part[n] = 0;
++	printf("SWEET TOUCH: syna code=%02x ver=%u mode=%u part=%s\n",
++	    msg[1], msg[4], mode, part);
++}
++
++static void
++syna_note_finger(unsigned id, bool down, unsigned x, unsigned y, unsigned cls)
++{
++	if (id >= TS_MAX_FINGERS) {
++		return;
++	}
++	if (ts.syna_max_x > 1 && x <= 8192) {
++		x = (unsigned)((uint32_t)x * 1079u / ts.syna_max_x);
++	}
++	if (ts.syna_max_y > 1 && y <= 8192) {
++		y = (unsigned)((uint32_t)y * 2399u / ts.syna_max_y);
++	}
++	if (down) {
++		if (!ts.down[id] || ts.x[id] != (int)x || ts.y[id] != (int)y) {
++			ts.down[id] = true;
++			ts.x[id] = (int)x;
++			ts.y[id] = (int)y;
++			sweet_hid_touch((int)id, 1, (int)x, (int)y);
++			ts.events++;
++			if (ts.syna_reports < 8) {
++				printf("SWEET TOUCH: finger %u down %u,%u cls=%u\n",
++				    id, x, y, cls);
++			}
++			ts.syna_reports++;
++		}
++	} else if (ts.down[id]) {
++		ts.down[id] = false;
++		sweet_hid_touch((int)id, 0, ts.x[id], ts.y[id]);
++		ts.events++;
++	}
++}
++
++static void
++syna_parse_report(const uint8_t *data, unsigned len)
++{
++	unsigned i = 0;
++	unsigned bit = 0;
++	unsigned obj = 0;
++	unsigned next = 0;
++	unsigned iter_bit = 0;
++	unsigned steps = 0;
++	bool active_only = false;
++	bool in_loop = false;
++	unsigned xs[TS_MAX_FINGERS];
++	unsigned ys[TS_MAX_FINGERS];
++	unsigned cls[TS_MAX_FINGERS];
++	unsigned got[TS_MAX_FINGERS];
++	unsigned seen = 0;
++
++	for (unsigned f = 0; f < TS_MAX_FINGERS; ++f) {
++		xs[f] = ys[f] = cls[f] = got[f] = 0;
++	}
++	if (ts.syna_cfg_len == 0) {
++		return;
++	}
++	while (i < ts.syna_cfg_len && steps++ < 500) {
++		unsigned code = ts.syna_cfg[i++];
++		unsigned nbits, value;
++		if (code == 0) {
++			break;
++		}
++		if (code == 1 || code == 2) {
++			active_only = (code == 1);
++			next = i;
++			obj = 0;
++			iter_bit = bit;
++			in_loop = true;
++			continue;
++		}
++		if (code == 3) {
++			unsigned used = bit - iter_bit;
++			if (active_only) {
++				if (used >= 8 && bit + used <= len * 8u) {
++					i = next;
++					iter_bit = bit;
++				} else {
++					in_loop = false;
++				}
++			} else if (obj + 1u < TS_MAX_FINGERS &&
++			    (used < 8 || bit + used <= len * 8u)) {
++				obj++;
++				i = next;
++				iter_bit = bit;
++			} else {
++				in_loop = false;
++			}
++			continue;
++		}
++		if (code == 4) {
++			if (bit & 7u) {
++				bit = (bit + 7u) & ~7u;
++			}
++			continue;
++		}
++		if (i >= ts.syna_cfg_len) {
++			break;
++		}
++		nbits = ts.syna_cfg[i++];
++		if (nbits == 0 || nbits > 32) {
++			break;
++		}
++		value = syna_bits(data, len, bit, nbits);
++		bit += nbits;
++		if (!in_loop) {
++			continue;
++		}
++		if (code == 6) {
++			obj = value;
++		} else if (obj < TS_MAX_FINGERS && code == 7) {
++			cls[obj] = value;
++			got[obj] |= 1u;
++		} else if (obj < TS_MAX_FINGERS && code == 8) {
++			xs[obj] = value;
++			got[obj] |= 2u;
++		} else if (obj < TS_MAX_FINGERS && code == 9) {
++			ys[obj] = value;
++			got[obj] |= 4u;
++		}
++	}
++	for (unsigned f = 0; f < TS_MAX_FINGERS; ++f) {
++		bool down = (got[f] & 6u) == 6u && ((got[f] & 1u) == 0 || cls[f] != 0);
++		if (down) {
++			seen |= 1u << f;
++			syna_note_finger(f, true, xs[f], ys[f], cls[f]);
++		}
++	}
++	for (unsigned f = 0; f < TS_MAX_FINGERS; ++f) {
++		if ((seen & (1u << f)) == 0) {
++			syna_note_finger(f, false, 0, 0, 0);
++		}
++	}
++}
++
++static int
++syna_poll(void)
++{
++	unsigned len = 0;
++	int level = (int)(ts_gpio_io_rd(TS_PIN_IRQ) & 1u);
++	int err;
++	static unsigned ticks;
++
++	ticks++;
++	if (level != syna_irq_level) {
++		if (ticks > 300 || (ticks % 20u) != 0) {
++			return 0;
++		}
++	}
++	err = syna_read_msg(syna_msg, sizeof(syna_msg), &len);
++	if (err == EAGAIN || err == ENXIO) {
++		return 0;
++	}
++	if (err) {
++		return err;
++	}
++	if (len < 4 || syna_msg[0] != SYNA_MARKER) {
++		return 0;
++	}
++	if (syna_irq_level != level) {
++		printf("SWEET TOUCH: syna irq ready when pin is %d\n", level);
++		syna_irq_level = level;
++	}
++	if (syna_msg[1] == SYNA_REPORT_TOUCH && len > 4) {
++		if (ts.syna_reports < 3) {
++			syna_log_hex("touch", syna_msg + 4, len - 4);
++		}
++		syna_parse_report(syna_msg + 4, len - 4);
++		return 1;
++	}
++	return 0;
++}
++
++static int
++syna_probe_addr(uint8_t addr)
++{
++	int err;
++
++	bb_start();
++	bb_tx_byte((uint8_t)(addr << 1));
++	err = bb_ack();
++	bb_stop();
++	return err;
++}
++
++static void
++syna_swap_pins(void)
++{
++	unsigned t = ts.sda_pin;
++	ts.sda_pin = ts.scl_pin;
++	ts.scl_pin = t;
++	bb_level(TS_PIN_I2C_A, false);
++	bb_level(TS_PIN_I2C_B, false);
++}
++
++static int
++syna_find(void)
++{
++	unsigned sda = ts.sda_pin;
++	unsigned scl = ts.scl_pin;
++
++	for (int pass = 0; pass < 2; ++pass) {
++		if (pass) {
++			syna_swap_pins();
++		}
++		if (syna_probe_addr(SYNA_ADDR) == 0) {
++			ts.syna_addr = SYNA_ADDR;
++			printf("SWEET TOUCH: syna ack sda=%u scl=%u\n",
++			    ts.sda_pin, ts.scl_pin);
++			return 0;
++		}
++	}
++	ts.sda_pin = sda;
++	ts.scl_pin = scl;
++	bb_level(TS_PIN_I2C_A, false);
++	bb_level(TS_PIN_I2C_B, false);
++	return ENXIO;
++}
++
++static void
++syna_reset_pin(bool pulse)
++{
++	if (pulse) {
++		ts_gpio(TS_PIN_RESET_7T, 0, 0, 3, true, false);
++		ts_wait(20);
++	}
++	ts_gpio(TS_PIN_RESET_7T, 0, 0, 3, true, true);
++	ts_wait(200);
++	bb_recover();
++}
++
++static int
++syna_setup(void)
++{
++	unsigned len = 0;
++	unsigned mode = 0;
++	int err;
++	static const uint8_t fallback_cfg[] = {
++		1, 6, 4, 7, 4, 8, 12, 9, 12, 3, 0
++	};
++
++	err = syna_cmd(SYNA_CMD_IDENTIFY, NULL, 0, syna_msg, sizeof(syna_msg), &len);
++	if (err) {
++		printf("SWEET TOUCH: syna identify %d\n", err);
++		return err;
++	}
++	syna_log_id(syna_msg, len);
++	if (len >= 6) {
++		mode = syna_msg[5];
++	}
++	if (mode != SYNA_MODE_APP) {
++		printf("SWEET TOUCH: syna mode %u, trying application\n", mode);
++		err = syna_cmd(SYNA_CMD_RUN_APP, NULL, 0, syna_msg, sizeof(syna_msg), &len);
++		printf("SWEET TOUCH: syna run-app %d\n", err);
++		ts_wait(150);
++		err = syna_cmd(SYNA_CMD_IDENTIFY, NULL, 0, syna_msg, sizeof(syna_msg), &len);
++		if (err == 0) {
++			syna_log_id(syna_msg, len);
++			if (len >= 6) {
++				mode = syna_msg[5];
++			}
++		}
++		if (mode != SYNA_MODE_APP) {
++			printf("SWEET TOUCH: syna stayed in mode %u\n", mode);
++			return ENODEV;
++		}
++	}
++
++	err = syna_cmd(SYNA_CMD_APPINFO, NULL, 0, syna_msg, sizeof(syna_msg), &len);
++	if (err == 0 && len >= 4 + 38) {
++		const uint8_t *p = syna_msg + 4;
++		ts.syna_max_x = (unsigned)p[32] | ((unsigned)p[33] << 8);
++		ts.syna_max_y = (unsigned)p[34] | ((unsigned)p[35] << 8);
++		printf("SWEET TOUCH: syna panel max %u x %u objects %u status %u\n",
++		    ts.syna_max_x, ts.syna_max_y,
++		    (unsigned)p[36] | ((unsigned)p[37] << 8),
++		    (unsigned)p[2] | ((unsigned)p[3] << 8));
++	} else {
++		printf("SWEET TOUCH: syna app-info %d len=%u\n", err, len);
++	}
++
++	err = syna_cmd(SYNA_CMD_GET_CFG, NULL, 0, syna_msg, sizeof(syna_msg), &len);
++	if (err == 0 && len > 5) {
++		unsigned n = len - 4;
++		if (n > sizeof(ts.syna_cfg)) {
++			n = sizeof(ts.syna_cfg);
++		}
++		for (unsigned i = 0; i < n; ++i) {
++			ts.syna_cfg[i] = syna_msg[4 + i];
++		}
++		ts.syna_cfg_len = n;
++		syna_log_hex("cfg", ts.syna_cfg, n);
++	} else {
++		printf("SWEET TOUCH: syna get-cfg %d, setting default\n", err);
++		err = syna_cmd(SYNA_CMD_SET_CFG, fallback_cfg, sizeof(fallback_cfg),
++		    syna_msg, sizeof(syna_msg), &len);
++		printf("SWEET TOUCH: syna set-cfg %d\n", err);
++		for (unsigned i = 0; i < sizeof(fallback_cfg); ++i) {
++			ts.syna_cfg[i] = fallback_cfg[i];
++		}
++		ts.syna_cfg_len = sizeof(fallback_cfg);
++	}
++
++	{
++		uint8_t nodoz[3] = {0x01, 0x01, 0x00};
++		err = syna_cmd(SYNA_CMD_SET_DC, nodoz, 3, syna_msg, sizeof(syna_msg), &len);
++		printf("SWEET TOUCH: syna no-doze %d\n", err);
++	}
++	{
++		uint8_t rep = SYNA_REPORT_TOUCH;
++		err = syna_cmd(SYNA_CMD_ENABLE, &rep, 1, syna_msg, sizeof(syna_msg), &len);
++		printf("SWEET TOUCH: syna enable %d\n", err);
++		if (err) {
++			return err;
++		}
++	}
++	printf("SWEET TOUCH: syna ready\n");
++	return 0;
++}
++
++static int
++syna_try(void)
++{
++	int err;
++
++	printf("SWEET TOUCH: syna probe reset gpio %u\n", TS_PIN_RESET_7T);
++	syna_reset_pin(false);
++	err = syna_find();
++	if (err) {
++		printf("SWEET TOUCH: syna no ack, pulsing reset\n");
++		syna_reset_pin(true);
++		err = syna_find();
++	}
++	if (err) {
++		printf("SWEET TOUCH: syna absent\n");
++		return err;
++	}
++	return syna_setup();
++}
++
+ static void
+ ts_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -585,9 +1177,13 @@
+ 	    ts.vreg_err, ts.ack_err, ts.id_err, ts.id[0], ts.id[1], ts.id[2],
+ 	    ts.sense_err, ts.events);
+ 
++	if (ts.ack_err && syna_try() == 0) {
++		ts.syna = true;
++	}
++
+ 	unsigned errors = 0, ticks = 0;
+ 	for (;;) {
+-		int r = ts_poll();
++		int r = ts.syna ? syna_poll() : ts_poll();
+ 		if (r < 0) {
+ 			if ((errors++ % 100u) == 0) {
+ 				printf("SWEET TOUCH: poll err=%d i2c-errors=%u\n",
+@@ -604,6 +1200,9 @@
+ 			printf("SWEET TOUCH: state vreg=%d ack=%d id_err=%d id=%02x%02x%02x sense=%d events=%u errs=%u\n",
+ 			    ts.vreg_err, ts.ack_err, ts.id_err, ts.id[0], ts.id[1], ts.id[2],
+ 			    ts.sense_err, ts.events, ts.i2c_errors);
++			printf("SWEET TOUCH: syna=%d reports=%u irq=%u cfg=%u\n",
++			    (int)ts.syna, ts.syna_reports,
++			    ts_gpio_io_rd(TS_PIN_IRQ) & 1u, ts.syna_cfg_len);
+ 		}
+ 		ts_wait(10);
+ 	}
