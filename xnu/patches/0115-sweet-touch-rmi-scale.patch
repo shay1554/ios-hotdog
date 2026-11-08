@@ -1,0 +1,38 @@
+--- a/bsd/dev/sweet_touch_sec.c
++++ b/bsd/dev/sweet_touch_sec.c
+@@ -745,10 +745,10 @@
+ 	if (id >= TS_MAX_FINGERS) {
+ 		return;
+ 	}
+-	if (ts.syna_max_x > 1 && x <= 8192) {
++	if (!ts.rmi && ts.syna_max_x > 1 && x <= 8192) {
+ 		x = (unsigned)((uint32_t)x * 1079u / ts.syna_max_x);
+ 	}
+-	if (ts.syna_max_y > 1 && y <= 8192) {
++	if (!ts.rmi && ts.syna_max_y > 1 && y <= 8192) {
+ 		y = (unsigned)((uint32_t)y * 2399u / ts.syna_max_y);
+ 	}
+ 	if (down) {
+@@ -1131,15 +1131,13 @@
+ 	if (ts.rmi_ctrl) {
+ 		uint8_t mx[4];
+ 		if (rmi_read_reg(ts.rmi_ctrl, mx, 4) == 0) {
+-			ts.syna_max_x = (unsigned)mx[0] | ((unsigned)mx[1] << 8);
+-			ts.syna_max_y = (unsigned)mx[2] | ((unsigned)mx[3] << 8);
+-			if (ts.syna_max_x < 100 || ts.syna_max_x > 4096) {
+-				ts.syna_max_x = 0;
+-			}
+-			if (ts.syna_max_y < 100 || ts.syna_max_y > 4096) {
+-				ts.syna_max_y = 0;
+-			}
+-			printf("SWEET TOUCH: rmi max %u,%u\n", ts.syna_max_x, ts.syna_max_y);
++			/*
++			 * These four bytes are not the panel size on the 7T
++			 * (ctrl_base_change). Scaling by them pulls every finger
++			 * up and left. The controller already reports panel pixels.
++			 */
++			printf("SWEET TOUCH: rmi ctrl %02x %02x %02x %02x\n",
++			    mx[0], mx[1], mx[2], mx[3]);
+ 		}
+ 	}
+ 	if (ts.rmi_f01_ctrl) {
