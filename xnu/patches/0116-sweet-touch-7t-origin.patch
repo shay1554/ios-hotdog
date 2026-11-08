@@ -1,0 +1,19 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -445,9 +445,14 @@ SweetHIDTouch::start(IOService *provider)
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? SWEET_DEV_FB_W : 1125;
+ 	fLogicalH = native ? SWEET_DEV_FB_H : 2436;
+-	fOffX = (fLogicalW - SWEET_DEV_FB_W) / 2;
+-	fOffY = (fLogicalH - SWEET_DEV_FB_H) / 2;
++	/*
++	 * Fingers arrive as 7T panel pixels (1080x2400). SWEET_DEV_FB_* is the
++	 * 7 Pro panel (1440x3120); subtracting that margin moved every touch
++	 * up and to the left on this glass.
++	 */
++	fOffX = (fLogicalW - 1080) / 2;
++	fOffY = (fLogicalH - 2400) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(SWEET_DEV_PANEL_MM_W << 16), 32);	/* mm, 16.16 */
