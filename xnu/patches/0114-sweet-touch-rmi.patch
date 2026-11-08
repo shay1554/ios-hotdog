@@ -1,0 +1,135 @@
+--- a/bsd/dev/sweet_touch_sec.c
++++ b/bsd/dev/sweet_touch_sec.c
+@@ -122,6 +122,9 @@
+ 	unsigned syna_max_x, syna_max_y;
+ 	unsigned syna_cfg_len;
+ 	uint8_t syna_cfg[128];
++	bool rmi;
++	uint8_t rmi_data;
++	uint8_t rmi_f01_ctrl;
+ } ts;
+ 
+ static uint32_t
+@@ -871,6 +874,9 @@
+ static int
+ syna_poll(void)
+ {
++	if (ts.rmi) {
++		return rmi_poll();
++	}
+ 	unsigned len = 0;
+ 	int level = (int)(ts_gpio_io_rd(TS_PIN_IRQ) & 1u);
+ 	int err;
+@@ -1053,6 +1059,100 @@
+ 	return 0;
+ }
+ 
++
++static int
++rmi_write_reg(uint8_t reg, uint8_t val)
++{
++	uint8_t t[2] = {reg, val};
++	return bb_write(ts.syna_addr, t, 2);
++}
++
++static int
++rmi_read_reg(uint8_t reg, uint8_t *buf, unsigned n)
++{
++	return bb_read(ts.syna_addr, reg, buf, n);
++}
++
++/* OnePlus 7T S3706 speaks RMI4, not TouchComm. PDT entries are 6 bytes. */
++static int
++rmi_setup(void)
++{
++	uint8_t ent[6];
++	uint8_t ctrl = 0;
++	int err;
++	bool found = false;
++
++	err = rmi_write_reg(0xff, 0x00);
++	if (err) {
++		printf("SWEET TOUCH: rmi page %d\n", err);
++		return err;
++	}
++	for (unsigned addr = 0xe9; addr >= 0xc9; addr -= 6) {
++		err = rmi_read_reg((uint8_t)addr, ent, 6);
++		if (err) {
++			printf("SWEET TOUCH: rmi pdt %02x err=%d\n", addr, err);
++			return err;
++		}
++		syna_log_hex("rmi", ent, 6);
++		printf("SWEET TOUCH: rmi fn %02x at %02x data=%02x ctrl=%02x\n",
++		    ent[5], addr, ent[3], ent[2]);
++		if (ent[5] == 0x00) {
++			break;
++		}
++		if (ent[5] == 0x12) {
++			ts.rmi_data = ent[3];
++			found = true;
++		} else if (ent[5] == 0x01) {
++			ts.rmi_f01_ctrl = ent[2];
++		}
++	}
++	if (!found || ts.rmi_data == 0) {
++		return ENXIO;
++	}
++	if (ts.rmi_f01_ctrl) {
++		err = rmi_read_reg(ts.rmi_f01_ctrl, &ctrl, 1);
++		printf("SWEET TOUCH: rmi devctrl %02x err=%d\n", ctrl, err);
++		if (err == 0) {
++			rmi_write_reg(ts.rmi_f01_ctrl, (uint8_t)((ctrl & 0xf8) | 0x80));
++		}
++		rmi_write_reg((uint8_t)(ts.rmi_f01_ctrl + 1), 0x7f);
++	}
++	ts.rmi = true;
++	printf("SWEET TOUCH: rmi ready data=%02x\n", ts.rmi_data);
++	return 0;
++}
++
++static int
++rmi_poll(void)
++{
++	uint8_t buf[80];
++	int err;
++	unsigned seen = 0;
++
++	err = rmi_read_reg(ts.rmi_data, buf, sizeof(buf));
++	if (err) {
++		return err;
++	}
++	if (ts.syna_reports < 2) {
++		syna_log_hex("f12", buf, 16);
++	}
++	for (unsigned i = 0; i < TS_MAX_FINGERS; ++i) {
++		unsigned o = i * 8u;
++		unsigned x = ((unsigned)(buf[o + 2] & 0x0f) << 8) | buf[o + 1];
++		unsigned y = ((unsigned)(buf[o + 4] & 0x0f) << 8) | buf[o + 3];
++		if (buf[o] != 0) {
++			seen |= 1u << i;
++			syna_note_finger(i, true, x, y, buf[o]);
++		}
++	}
++	for (unsigned i = 0; i < TS_MAX_FINGERS; ++i) {
++		if ((seen & (1u << i)) == 0) {
++			syna_note_finger(i, false, 0, 0, 0);
++		}
++	}
++	return 0;
++}
++
+ static int
+ syna_try(void)
+ {
+@@ -1070,6 +1170,11 @@
+ 		printf("SWEET TOUCH: syna absent\n");
+ 		return err;
+ 	}
++	err = rmi_setup();
++	if (err == 0) {
++		return 0;
++	}
++	printf("SWEET TOUCH: rmi setup %d\n", err);
+ 	return syna_setup();
+ }
+ 
