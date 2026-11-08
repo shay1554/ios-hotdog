@@ -1,26 +1,39 @@
 --- a/bsd/dev/sweet_touch_sec.c
 +++ b/bsd/dev/sweet_touch_sec.c
-@@ -122,6 +122,9 @@
+@@ -122,6 +122,10 @@
  	unsigned syna_max_x, syna_max_y;
  	unsigned syna_cfg_len;
  	uint8_t syna_cfg[128];
 +	bool rmi;
 +	uint8_t rmi_data;
++	uint8_t rmi_ctrl;
 +	uint8_t rmi_f01_ctrl;
  } ts;
  
  static uint32_t
-@@ -871,6 +874,9 @@
+@@ -868,13 +872,20 @@
+ 	}
+ }
+ 
++static int rmi_poll(void);
++
  static int
  syna_poll(void)
  {
+ 	unsigned len = 0;
+-	int level = (int)(ts_gpio_io_rd(TS_PIN_IRQ) & 1u);
++	int level;
+ 	int err;
+ 	static unsigned ticks;
++
 +	if (ts.rmi) {
 +		return rmi_poll();
 +	}
- 	unsigned len = 0;
- 	int level = (int)(ts_gpio_io_rd(TS_PIN_IRQ) & 1u);
- 	int err;
-@@ -1053,6 +1059,100 @@
++	level = (int)(ts_gpio_io_rd(TS_PIN_IRQ) & 1u);
+ 
+ 	ticks++;
+ 	if (level != syna_irq_level) {
+@@ -1053,6 +1064,130 @@
  	return 0;
  }
  
@@ -56,7 +69,7 @@
 +		err = rmi_read_reg((uint8_t)addr, ent, 6);
 +		if (err) {
 +			printf("SWEET TOUCH: rmi pdt %02x err=%d\n", addr, err);
-+			return err;
++			break;
 +		}
 +		syna_log_hex("rmi", ent, 6);
 +		printf("SWEET TOUCH: rmi fn %02x at %02x data=%02x ctrl=%02x\n",
@@ -66,13 +79,41 @@
 +		}
 +		if (ent[5] == 0x12) {
 +			ts.rmi_data = ent[3];
++			ts.rmi_ctrl = ent[2];
 +			found = true;
 +		} else if (ent[5] == 0x01) {
 +			ts.rmi_f01_ctrl = ent[2];
 +		}
 +	}
++	if (!found) {
++		uint8_t b4[4];
++		if (rmi_read_reg(0xdd, b4, 4) == 0 && b4[3] != 0 && b4[3] != 0xff) {
++			ts.rmi_data = b4[3];
++			ts.rmi_ctrl = b4[2];
++			found = true;
++			printf("SWEET TOUCH: rmi fixed data=%02x ctrl=%02x\n", b4[3], b4[2]);
++		}
++		if (rmi_read_reg(0xe3, b4, 4) == 0) {
++			ts.rmi_f01_ctrl = b4[2];
++			printf("SWEET TOUCH: rmi f01 ctrl=%02x data=%02x\n", b4[2], b4[3]);
++		}
++	}
 +	if (!found || ts.rmi_data == 0) {
 +		return ENXIO;
++	}
++	if (ts.rmi_ctrl) {
++		uint8_t mx[4];
++		if (rmi_read_reg(ts.rmi_ctrl, mx, 4) == 0) {
++			ts.syna_max_x = (unsigned)mx[0] | ((unsigned)mx[1] << 8);
++			ts.syna_max_y = (unsigned)mx[2] | ((unsigned)mx[3] << 8);
++			if (ts.syna_max_x < 100 || ts.syna_max_x > 4096) {
++				ts.syna_max_x = 0;
++			}
++			if (ts.syna_max_y < 100 || ts.syna_max_y > 4096) {
++				ts.syna_max_y = 0;
++			}
++			printf("SWEET TOUCH: rmi max %u,%u\n", ts.syna_max_x, ts.syna_max_y);
++		}
 +	}
 +	if (ts.rmi_f01_ctrl) {
 +		err = rmi_read_reg(ts.rmi_f01_ctrl, &ctrl, 1);
@@ -90,22 +131,24 @@
 +static int
 +rmi_poll(void)
 +{
-+	uint8_t buf[80];
++	uint8_t buf[16];
 +	int err;
 +	unsigned seen = 0;
++	unsigned nslot = sizeof(buf) / 8u;
 +
 +	err = rmi_read_reg(ts.rmi_data, buf, sizeof(buf));
 +	if (err) {
-+		return err;
++		return -1;
 +	}
 +	if (ts.syna_reports < 2) {
-+		syna_log_hex("f12", buf, 16);
++		syna_log_hex("f12", buf, sizeof(buf));
 +	}
-+	for (unsigned i = 0; i < TS_MAX_FINGERS; ++i) {
++	for (unsigned i = 0; i < nslot && i < TS_MAX_FINGERS; ++i) {
 +		unsigned o = i * 8u;
++		unsigned st = (unsigned)buf[o] & 0x07u;
 +		unsigned x = ((unsigned)(buf[o + 2] & 0x0f) << 8) | buf[o + 1];
 +		unsigned y = ((unsigned)(buf[o + 4] & 0x0f) << 8) | buf[o + 3];
-+		if (buf[o] != 0) {
++		if (st >= 1 && st <= 3) {
 +			seen |= 1u << i;
 +			syna_note_finger(i, true, x, y, buf[o]);
 +		}
@@ -121,7 +164,7 @@
  static int
  syna_try(void)
  {
-@@ -1070,6 +1170,11 @@
+@@ -1070,6 +1205,11 @@
  		printf("SWEET TOUCH: syna absent\n");
  		return err;
  	}
