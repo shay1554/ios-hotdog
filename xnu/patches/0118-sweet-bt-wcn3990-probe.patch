@@ -1,0 +1,319 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_bt.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_touch_sec.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -49,6 +49,7 @@ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ void sweet_gpu_init(void);
++void sweet_bt_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+@@ -663,6 +664,7 @@ sweet_ufs_mount(void)
+ 	sweet_usb_probe();
+ #if defined(ARM64_BOARD_CONFIG_GUACAMOLE)
+ 	sweet_gpu_init();	/* no-op unless sweetgpu=N is on the command line */
++	sweet_bt_init();
+ #endif
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/sweet_bt.c
+@@ -0,0 +1,318 @@
++/*
++ * OnePlus 7T Bluetooth probe. WCN3990 is on GENI SE13 (0xc8c000), not the
++ * touch engine. This thread powers the chip and, when the UART firmware is
++ * already loaded, sends one HCI Reset. It does not own the Settings toggle.
++ */
++#if defined(ARM64_BOARD_CONFIG_GUACAMOLE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/sweet_dev.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define BT_SE_PA        0x00c8c000u
++#define BT_TLMM_PA      SWEET_DEV_TOUCH_NORTH_PA
++#define BT_EN_GPIO      172u
++#define BT_UART_CTS     43u
++#define BT_UART_RTS     44u
++#define BT_UART_TX      45u
++#define BT_UART_RX      46u
++
++#define SE_GENI_STATUS          0x040u
++#define SE_GENI_SER_M_CLK_CFG   0x048u
++#define SE_GENI_FW_REVISION     0x068u
++#define SE_GENI_IF_DISABLE      0x064u
++#define SE_GENI_CLK_SEL         0x07cu
++#define SE_GENI_DMA_MODE_EN     0x258u
++#define SE_UART_TX_TRANS_CFG    0x25cu
++#define SE_UART_TX_WORD_LEN     0x268u
++#define SE_UART_TX_STOP_BIT_LEN 0x26cu
++#define SE_UART_TX_TRANS_LEN    0x270u
++#define SE_UART_RX_TRANS_CFG    0x280u
++#define SE_UART_RX_WORD_LEN     0x28cu
++#define SE_UART_RX_STALE_CNT    0x294u
++#define SE_UART_TX_PARITY_CFG   0x2a4u
++#define SE_UART_RX_PARITY_CFG   0x2a8u
++#define SE_UART_MANUAL_RFR      0x2acu
++#define SE_GENI_M_CMD0          0x600u
++#define SE_GENI_M_IRQ_STATUS    0x610u
++#define SE_GENI_M_IRQ_CLEAR     0x618u
++#define SE_GENI_S_CMD0          0x630u
++#define SE_GENI_S_IRQ_STATUS    0x640u
++#define SE_GENI_S_IRQ_CLEAR     0x648u
++#define SE_GENI_TX_FIFOn        0x700u
++#define SE_GENI_RX_FIFOn        0x780u
++#define SE_GENI_TX_FIFO_STATUS  0x800u
++#define SE_GENI_RX_FIFO_STATUS  0x804u
++#define SE_GENI_IOS             0x908u
++
++#define GENI_SE_UART            2u
++#define M_CMD_DONE              0x1u
++#define UART_START_TX           1u
++#define UART_START_READ         1u
++#define M_OPCODE_SHIFT          27u
++#define S_OPCODE_SHIFT          27u
++
++enum { BT_WEST, BT_EAST, BT_NORTH, BT_SOUTH, BT_TILES };
++
++static vm_offset_t bt_tiles[BT_TILES];
++static vm_offset_t bt_se;
++static bool bt_started;
++
++static uint32_t
++bt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++bt_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static unsigned
++bt_tile(unsigned pin)
++{
++	if (pin <= 7 || pin == 38 || (pin >= 51 && pin <= 82) ||
++	    (pin >= 98 && pin <= 101) || (pin >= 114 && pin <= 124) ||
++	    (pin >= 126 && pin <= 154)) {
++		return BT_SOUTH;
++	}
++	if ((pin >= 8 && pin <= 20) || (pin >= 31 && pin <= 37) ||
++	    (pin >= 39 && pin <= 42) || (pin >= 83 && pin <= 86) ||
++	    (pin >= 88 && pin <= 97) || (pin >= 102 && pin <= 104) ||
++	    pin >= 169) {
++		return BT_NORTH;
++	}
++	if ((pin >= 21 && pin <= 30) || (pin >= 43 && pin <= 50) || pin == 87) {
++		return BT_EAST;
++	}
++	return BT_WEST;
++}
++
++static uint32_t
++bt_gpio_rd(unsigned pin)
++{
++	return bt_rd(bt_tiles[bt_tile(pin)], pin * 0x1000u);
++}
++
++static uint32_t
++bt_gpio_io_rd(unsigned pin)
++{
++	return bt_rd(bt_tiles[bt_tile(pin)], pin * 0x1000u + 4u);
++}
++
++static void
++bt_gpio_wr(unsigned pin, uint32_t v)
++{
++	bt_wr(bt_tiles[bt_tile(pin)], pin * 0x1000u, v);
++}
++
++static void
++bt_gpio_io_wr(unsigned pin, uint32_t v)
++{
++	bt_wr(bt_tiles[bt_tile(pin)], pin * 0x1000u + 4u, v);
++}
++
++static void
++bt_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&bt_started, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* mux 1 is qup13 on gpio43-46. pull: 0 none, 1 down, 3 up. */
++static void
++bt_pin(unsigned pin, unsigned mux, unsigned pull, bool out, bool high)
++{
++	if (out) {
++		bt_gpio_io_wr(pin, (bt_gpio_io_rd(pin) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t cfg = bt_gpio_rd(pin) & ~0x3ffu;
++	cfg |= (mux << 2) | pull | (1u << 6) | (out ? 0x200u : 0u);
++	bt_gpio_wr(pin, cfg);
++}
++
++static void
++bt_send_hci_reset(void)
++{
++	static const uint8_t reset[4] = { 0x01, 0x03, 0x0c, 0x00 };
++	uint32_t word = 0;
++	unsigned i;
++
++	bt_wr(bt_se, SE_GENI_DMA_MODE_EN, 0);
++	bt_wr(bt_se, SE_UART_TX_TRANS_CFG, 0);
++	bt_wr(bt_se, SE_UART_TX_WORD_LEN, 8);
++	bt_wr(bt_se, SE_UART_TX_STOP_BIT_LEN, 0);
++	bt_wr(bt_se, SE_UART_TX_PARITY_CFG, 0);
++	bt_wr(bt_se, SE_UART_RX_PARITY_CFG, 0);
++	bt_wr(bt_se, SE_UART_RX_WORD_LEN, 8);
++	bt_wr(bt_se, SE_UART_RX_TRANS_CFG, 0);
++	bt_wr(bt_se, SE_UART_RX_STALE_CNT, 16);
++	bt_wr(bt_se, SE_UART_MANUAL_RFR, 0);
++	bt_wr(bt_se, SE_UART_TX_TRANS_LEN, sizeof(reset));
++	bt_wr(bt_se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	bt_wr(bt_se, SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
++	bt_wr(bt_se, SE_GENI_M_CMD0, UART_START_TX << M_OPCODE_SHIFT);
++	for (i = 0; i < sizeof(reset); i += 4) {
++		word = reset[i];
++		if (i + 1 < sizeof(reset)) {
++			word |= (uint32_t)reset[i + 1] << 8;
++		}
++		if (i + 2 < sizeof(reset)) {
++			word |= (uint32_t)reset[i + 2] << 16;
++		}
++		if (i + 3 < sizeof(reset)) {
++			word |= (uint32_t)reset[i + 3] << 24;
++		}
++		bt_wr(bt_se, SE_GENI_TX_FIFOn, word);
++	}
++	bt_wr(bt_se, SE_GENI_S_CMD0, UART_START_READ << S_OPCODE_SHIFT);
++	for (i = 0; i < 20; ++i) {
++		uint32_t rx = bt_rd(bt_se, SE_GENI_RX_FIFO_STATUS);
++		uint32_t mirq = bt_rd(bt_se, SE_GENI_M_IRQ_STATUS);
++		if ((rx & 0x01ffffffu) != 0 || (mirq & M_CMD_DONE) != 0) {
++			uint32_t sample = bt_rd(bt_se, SE_GENI_RX_FIFOn);
++			printf("SWEET BT: hci mirq=%#x rxstat=%#x word=%#x\n",
++			    mirq, rx, sample);
++			return;
++		}
++		bt_wait(10);
++	}
++	printf("SWEET BT: hci reset timed out mirq=%#x rxstat=%#x txstat=%#x\n",
++	    bt_rd(bt_se, SE_GENI_M_IRQ_STATUS),
++	    bt_rd(bt_se, SE_GENI_RX_FIFO_STATUS),
++	    bt_rd(bt_se, SE_GENI_TX_FIFO_STATUS));
++}
++
++static void
++bt_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	unsigned i;
++	uint32_t fw, proto, clk;
++	vm_offset_t gcc;
++
++	printf("SWEET BT: waiting until touch owns SE17\n");
++	bt_wait(25000);
++
++	bt_tiles[BT_WEST] = ml_io_map(BT_TLMM_PA + 0x00100000u, 0x100000);
++	bt_tiles[BT_EAST] = ml_io_map(BT_TLMM_PA + 0x00500000u, 0x100000);
++	bt_tiles[BT_NORTH] = ml_io_map(BT_TLMM_PA + 0x00900000u, 0x100000);
++	bt_tiles[BT_SOUTH] = ml_io_map(BT_TLMM_PA + 0x00d00000u, 0x100000);
++	bt_se = ml_io_map(BT_SE_PA, 0x1000);
++	gcc = ml_io_map(SWEET_DEV_TOUCH_GCC_PA, 0x200000);
++	if (!bt_se || !gcc || !bt_tiles[0] || !bt_tiles[1] || !bt_tiles[2] ||
++	    !bt_tiles[3]) {
++		printf("SWEET BT: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("SWEET BT: gcc vote=%#x\n", bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE));
++	if ((bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE) & 1u) == 0) {
++		bt_wr(gcc, SWEET_DEV_TOUCH_GCC_VOTE,
++		    bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE) | 1u);
++		printf("SWEET BT: gcc vote now %#x\n",
++		    bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE));
++	}
++
++	bt_pin(BT_UART_CTS, 1, 0, false, false);
++	bt_pin(BT_UART_RX, 1, 0, false, false);
++	bt_pin(BT_UART_RTS, 1, 1, false, false);
++	bt_pin(BT_UART_TX, 1, 3, false, false);
++	bt_pin(BT_EN_GPIO, 0, 1, true, false);
++	bt_wait(20);
++	bt_pin(BT_EN_GPIO, 0, 1, true, true);
++	bt_wait(150);
++
++	fw = bt_rd(bt_se, SE_GENI_FW_REVISION);
++	proto = (fw >> 8) & 0xffu;
++	clk = bt_rd(bt_se, SE_GENI_SER_M_CLK_CFG);
++	printf("SWEET BT: se13 fw=%#x proto=%u dis=%u ios=%#x clk=%#x stat=%#x\n",
++	    fw, proto, bt_rd(bt_se, SE_GENI_IF_DISABLE) & 1u,
++	    bt_rd(bt_se, SE_GENI_IOS), clk, bt_rd(bt_se, SE_GENI_STATUS));
++	printf("SWEET BT: en gpio172=%#x tx45=%#x rx46=%#x\n",
++	    bt_gpio_rd(BT_EN_GPIO), bt_gpio_rd(BT_UART_TX), bt_gpio_rd(BT_UART_RX));
++	if (proto != GENI_SE_UART) {
++		printf("SWEET BT: UART firmware is not loaded on SE13\n");
++		goto out;
++	}
++	if ((clk & 1u) == 0) {
++		/* 19.2 MHz / 11 / 16 is the closest 115200 without a dedicated RCG. */
++		bt_wr(bt_se, SE_GENI_SER_M_CLK_CFG, (11u << 4) | 1u);
++		printf("SWEET BT: serial clock was off, set %#x\n",
++		    bt_rd(bt_se, SE_GENI_SER_M_CLK_CFG));
++	}
++	(void)bt_rd(bt_se, SE_GENI_CLK_SEL);
++	bt_send_hci_reset();
++	for (i = 0; i < 4; ++i) {
++		printf("SWEET BT: rx[%u]=%#x\n", i, bt_rd(bt_se, SE_GENI_RX_FIFOn));
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_bt_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (bt_started) {
++		return;
++	}
++	bt_started = true;
++	(void)PE_parse_boot_argn("sweetbt", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET BT: disabled (sweetbt=0)\n");
++		return;
++	}
++	if (kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET BT: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_GUACAMOLE */
