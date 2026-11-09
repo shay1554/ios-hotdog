@@ -30,7 +30,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_bt.c
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,291 @@
 +/*
 + * OnePlus 7T Bluetooth probe. WCN3990 is on GENI SE13 (0xc8c000), not the
 + * touch engine. This thread powers the chip and, when the UART firmware is
@@ -192,7 +192,7 @@
 +	bt_wr(bt_se, SE_GENI_DMA_MODE_EN, 0);
 +	bt_wr(bt_se, SE_UART_TX_TRANS_CFG, 0);
 +	bt_wr(bt_se, SE_UART_TX_WORD_LEN, 8);
-+	bt_wr(bt_se, SE_UART_TX_STOP_BIT_LEN, 0);
++	bt_wr(bt_se, SE_UART_TX_STOP_BIT_LEN, 8);
 +	bt_wr(bt_se, SE_UART_TX_PARITY_CFG, 0);
 +	bt_wr(bt_se, SE_UART_RX_PARITY_CFG, 0);
 +	bt_wr(bt_se, SE_UART_RX_WORD_LEN, 8);
@@ -279,18 +279,17 @@
 +	printf("SWEET BT: se13 fw=%#x proto=%u dis=%u ios=%#x clk=%#x stat=%#x\n",
 +	    fw, proto, bt_rd(bt_se, SE_GENI_IF_DISABLE) & 1u,
 +	    bt_rd(bt_se, SE_GENI_IOS), clk, bt_rd(bt_se, SE_GENI_STATUS));
-+	printf("SWEET BT: en gpio172=%#x tx45=%#x rx46=%#x\n",
-+	    bt_gpio_rd(BT_EN_GPIO), bt_gpio_rd(BT_UART_TX), bt_gpio_rd(BT_UART_RX));
++	printf("SWEET BT: en gpio172=%#x io=%#x tx45=%#x rx46=%#x\n",
++	    bt_gpio_rd(BT_EN_GPIO), bt_gpio_io_rd(BT_EN_GPIO),
++	    bt_gpio_rd(BT_UART_TX), bt_gpio_rd(BT_UART_RX));
 +	if (proto != GENI_SE_UART) {
 +		printf("SWEET BT: UART firmware is not loaded on SE13\n");
 +		goto out;
 +	}
-+	if ((clk & 1u) == 0) {
-+		/* 19.2 MHz / 11 / 16 is the closest 115200 without a dedicated RCG. */
-+		bt_wr(bt_se, SE_GENI_SER_M_CLK_CFG, (11u << 4) | 1u);
-+		printf("SWEET BT: serial clock was off, set %#x\n",
-+		    bt_rd(bt_se, SE_GENI_SER_M_CLK_CFG));
-+	}
++	/* 19.2 MHz / 11 / 16 is the closest 115200. Divider 1 is about 1.2 Mbaud. */
++	bt_wr(bt_se, SE_GENI_SER_M_CLK_CFG, (11u << 4) | 1u);
++	printf("SWEET BT: serial clock %#x -> %#x\n",
++	    clk, bt_rd(bt_se, SE_GENI_SER_M_CLK_CFG));
 +	(void)bt_rd(bt_se, SE_GENI_CLK_SEL);
 +	bt_send_hci_reset();
 +	for (i = 0; i < 4; ++i) {
