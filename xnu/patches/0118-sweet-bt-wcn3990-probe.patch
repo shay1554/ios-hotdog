@@ -30,7 +30,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_bt.c
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,292 @@
 +/*
 + * OnePlus 7T Bluetooth probe. WCN3990 is on GENI SE13 (0xc8c000), not the
 + * touch engine. This thread powers the chip and, when the UART firmware is
@@ -92,9 +92,12 @@
 +#define M_OPCODE_SHIFT          27u
 +#define S_OPCODE_SHIFT          27u
 +
-+enum { BT_WEST, BT_EAST, BT_NORTH, BT_SOUTH, BT_TILES };
++enum { BT_PIN_CTS, BT_PIN_RTS, BT_PIN_TX, BT_PIN_RX, BT_PIN_EN, BT_PIN_COUNT };
 +
-+static vm_offset_t bt_tiles[BT_TILES];
++static const unsigned bt_pin_num[BT_PIN_COUNT] = {
++	BT_UART_CTS, BT_UART_RTS, BT_UART_TX, BT_UART_RX, BT_EN_GPIO
++};
++static vm_offset_t bt_pin_va[BT_PIN_COUNT];
 +static vm_offset_t bt_se;
 +static bool bt_started;
 +
@@ -114,48 +117,48 @@
 +	__asm__ volatile("dsb osh" ::: "memory");
 +}
 +
-+static unsigned
-+bt_tile(unsigned pin)
++/* EAST is gpio 43-46. NORTH is gpio 172. One page covers cfg and the data bit. */
++static uint32_t
++bt_pin_pa(unsigned pin)
 +{
-+	if (pin <= 7 || pin == 38 || (pin >= 51 && pin <= 82) ||
-+	    (pin >= 98 && pin <= 101) || (pin >= 114 && pin <= 124) ||
-+	    (pin >= 126 && pin <= 154)) {
-+		return BT_SOUTH;
++	uint32_t tile = BT_TLMM_PA + ((pin >= 169u) ? 0x00900000u : 0x00500000u);
++	return tile + pin * 0x1000u;
++}
++
++static vm_offset_t
++bt_pin_base(unsigned pin)
++{
++	unsigned i;
++	for (i = 0; i < BT_PIN_COUNT; i++) {
++		if (bt_pin_num[i] == pin) {
++			return bt_pin_va[i];
++		}
 +	}
-+	if ((pin >= 8 && pin <= 20) || (pin >= 31 && pin <= 37) ||
-+	    (pin >= 39 && pin <= 42) || (pin >= 83 && pin <= 86) ||
-+	    (pin >= 88 && pin <= 97) || (pin >= 102 && pin <= 104) ||
-+	    pin >= 169) {
-+		return BT_NORTH;
-+	}
-+	if ((pin >= 21 && pin <= 30) || (pin >= 43 && pin <= 50) || pin == 87) {
-+		return BT_EAST;
-+	}
-+	return BT_WEST;
++	return 0;
 +}
 +
 +static uint32_t
 +bt_gpio_rd(unsigned pin)
 +{
-+	return bt_rd(bt_tiles[bt_tile(pin)], pin * 0x1000u);
++	return bt_rd(bt_pin_base(pin), 0);
 +}
 +
 +static uint32_t
 +bt_gpio_io_rd(unsigned pin)
 +{
-+	return bt_rd(bt_tiles[bt_tile(pin)], pin * 0x1000u + 4u);
++	return bt_rd(bt_pin_base(pin), 4);
 +}
 +
 +static void
 +bt_gpio_wr(unsigned pin, uint32_t v)
 +{
-+	bt_wr(bt_tiles[bt_tile(pin)], pin * 0x1000u, v);
++	bt_wr(bt_pin_base(pin), 0, v);
 +}
 +
 +static void
 +bt_gpio_io_wr(unsigned pin, uint32_t v)
 +{
-+	bt_wr(bt_tiles[bt_tile(pin)], pin * 0x1000u + 4u, v);
++	bt_wr(bt_pin_base(pin), 4, v);
 +}
 +
 +static void
@@ -241,23 +244,24 @@
 +	printf("SWEET BT: waiting until touch owns SE17\n");
 +	bt_wait(25000);
 +
-+	bt_tiles[BT_WEST] = ml_io_map(BT_TLMM_PA + 0x00100000u, 0x100000);
-+	bt_tiles[BT_EAST] = ml_io_map(BT_TLMM_PA + 0x00500000u, 0x100000);
-+	bt_tiles[BT_NORTH] = ml_io_map(BT_TLMM_PA + 0x00900000u, 0x100000);
-+	bt_tiles[BT_SOUTH] = ml_io_map(BT_TLMM_PA + 0x00d00000u, 0x100000);
++	for (i = 0; i < BT_PIN_COUNT; i++) {
++		bt_pin_va[i] = ml_io_map(bt_pin_pa(bt_pin_num[i]), 0x1000);
++	}
 +	bt_se = ml_io_map(BT_SE_PA, 0x1000);
-+	gcc = ml_io_map(SWEET_DEV_TOUCH_GCC_PA, 0x200000);
-+	if (!bt_se || !gcc || !bt_tiles[0] || !bt_tiles[1] || !bt_tiles[2] ||
-+	    !bt_tiles[3]) {
++	gcc = ml_io_map(SWEET_DEV_TOUCH_GCC_PA + (SWEET_DEV_TOUCH_GCC_VOTE & ~0xfffu),
++	    0x1000);
++	if (!bt_se || !gcc || !bt_pin_va[BT_PIN_CTS] || !bt_pin_va[BT_PIN_RTS] ||
++	    !bt_pin_va[BT_PIN_TX] || !bt_pin_va[BT_PIN_RX] || !bt_pin_va[BT_PIN_EN]) {
 +		printf("SWEET BT: MMIO mapping failed\n");
 +		goto out;
 +	}
-+	printf("SWEET BT: gcc vote=%#x\n", bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE));
-+	if ((bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE) & 1u) == 0) {
-+		bt_wr(gcc, SWEET_DEV_TOUCH_GCC_VOTE,
-+		    bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE) | 1u);
++	printf("SWEET BT: gcc vote=%#x\n",
++	    bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE & 0xfffu));
++	if ((bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE & 0xfffu) & 1u) == 0) {
++		bt_wr(gcc, SWEET_DEV_TOUCH_GCC_VOTE & 0xfffu,
++		    bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE & 0xfffu) | 1u);
 +		printf("SWEET BT: gcc vote now %#x\n",
-+		    bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE));
++		    bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE & 0xfffu));
 +	}
 +
 +	bt_pin(BT_UART_CTS, 1, 0, false, false);
