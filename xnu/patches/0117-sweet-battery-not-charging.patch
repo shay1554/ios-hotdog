@@ -1,0 +1,16 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -208,7 +208,12 @@ SweetBattery::poll(void)
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
++		/*
++		 * The 7T gauge is not the sweet PM6150 this probe reads, so the
++		 * sample fails. Report a battery, not a cable: external=true is
++		 * what draws the charging bolt.
++		 */
++		publish(100, 4200, 0, false, false, false, false, false, false);
+ 		return;
+ 	}
+ 	bool external = (usb & 0x10u) != 0;
