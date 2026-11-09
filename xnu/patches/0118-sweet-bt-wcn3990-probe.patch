@@ -30,7 +30,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_bt.c
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,288 @@
 +/*
 + * OnePlus 7T Bluetooth probe. WCN3990 is on GENI SE13 (0xc8c000), not the
 + * touch engine. This thread powers the chip and, when the UART firmware is
@@ -47,6 +47,7 @@
 +#include <pexpert/arm64/sweet_dev.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
 +
 +#define BT_SE_PA        0x00c8c000u
 +#define BT_TLMM_PA      SWEET_DEV_TOUCH_NORTH_PA
