@@ -30,7 +30,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_bt.c
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,309 @@
 +/*
 + * OnePlus 7T Bluetooth probe. WCN3990 is on GENI SE13 (0xc8c000), not the
 + * touch engine. This thread powers the chip and, when the UART firmware is
@@ -74,9 +74,11 @@
 +#define SE_UART_RX_PARITY_CFG   0x2a8u
 +#define SE_UART_MANUAL_RFR      0x2acu
 +#define SE_GENI_M_CMD0          0x600u
++#define SE_GENI_M_CMD_CTRL      0x604u
 +#define SE_GENI_M_IRQ_STATUS    0x610u
 +#define SE_GENI_M_IRQ_CLEAR     0x618u
 +#define SE_GENI_S_CMD0          0x630u
++#define SE_GENI_S_CMD_CTRL      0x634u
 +#define SE_GENI_S_IRQ_STATUS    0x640u
 +#define SE_GENI_S_IRQ_CLEAR     0x648u
 +#define SE_GENI_TX_FIFOn        0x700u
@@ -87,6 +89,8 @@
 +
 +#define GENI_SE_UART            2u
 +#define M_CMD_DONE              0x1u
++#define GENI_CMD_ABORT          (1u << 1)
++#define GENI_CMD_CANCEL         (1u << 2)
 +#define UART_START_TX           1u
 +#define UART_START_READ         1u
 +#define M_OPCODE_SHIFT          27u
@@ -182,6 +186,21 @@
 +	bt_gpio_wr(pin, cfg);
 +}
 +
++/* Freeze the engine before a clock write. A live divider change wedged the bus. */
++static void
++bt_quiesce(void)
++{
++	bt_wr(bt_se, SE_GENI_M_CMD_CTRL, GENI_CMD_CANCEL);
++	bt_wr(bt_se, SE_GENI_S_CMD_CTRL, GENI_CMD_CANCEL);
++	bt_wait(2);
++	bt_wr(bt_se, SE_GENI_M_CMD_CTRL, GENI_CMD_ABORT);
++	bt_wr(bt_se, SE_GENI_S_CMD_CTRL, GENI_CMD_ABORT);
++	bt_wr(bt_se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	bt_wr(bt_se, SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
++	bt_wr(bt_se, SE_GENI_IF_DISABLE, 1);
++	bt_wait(2);
++}
++
 +static void
 +bt_send_hci_reset(void)
 +{
@@ -257,12 +276,6 @@
 +	}
 +	printf("SWEET BT: gcc vote=%#x\n",
 +	    bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE & 0xfffu));
-+	if ((bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE & 0xfffu) & 1u) == 0) {
-+		bt_wr(gcc, SWEET_DEV_TOUCH_GCC_VOTE & 0xfffu,
-+		    bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE & 0xfffu) | 1u);
-+		printf("SWEET BT: gcc vote now %#x\n",
-+		    bt_rd(gcc, SWEET_DEV_TOUCH_GCC_VOTE & 0xfffu));
-+	}
 +
 +	bt_pin(BT_UART_CTS, 1, 0, false, false);
 +	bt_pin(BT_UART_RX, 1, 0, false, false);
@@ -287,14 +300,19 @@
 +		goto out;
 +	}
 +	/* 19.2 MHz / 11 / 16 is the closest 115200. Divider 1 is about 1.2 Mbaud. */
++	bt_quiesce();
 +	bt_wr(bt_se, SE_GENI_SER_M_CLK_CFG, (11u << 4) | 1u);
-+	printf("SWEET BT: serial clock %#x -> %#x\n",
-+	    clk, bt_rd(bt_se, SE_GENI_SER_M_CLK_CFG));
++	bt_wr(bt_se, SE_GENI_IF_DISABLE, 0);
++	bt_wait(2);
++	printf("SWEET BT: serial clock %#x -> %#x dis=%u\n",
++	    clk, bt_rd(bt_se, SE_GENI_SER_M_CLK_CFG),
++	    bt_rd(bt_se, SE_GENI_IF_DISABLE) & 1u);
 +	(void)bt_rd(bt_se, SE_GENI_CLK_SEL);
 +	bt_send_hci_reset();
 +	for (i = 0; i < 4; ++i) {
 +		printf("SWEET BT: rx[%u]=%#x\n", i, bt_rd(bt_se, SE_GENI_RX_FIFOn));
 +	}
++	bt_quiesce();
 +out:
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
